@@ -1,0 +1,21 @@
+.gcs-node-label {
+  position: fixed;
+  z-index: var(--layer-tooltip, 1000);
+  pointer-events: none;
+  padding: 3px 8px;
+  border-radius: var(--radius-s, 4px);
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  color: var(--text-normal);
+  font-size: var(--font-ui-small, 13px);
+  white-space: nowrap;
+  box-shadow: var(--shadow-s);
+}
+
+/* Obsidian's ring around the open note's node: black in light mode, white in dark mode. */
+body.gcs-bw-nodes.theme-light .graph-view.color-circle {
+  color: #000000;
+}
+body.gcs-bw-nodes.theme-dark .graph-view.color-circle {
+  color: #ffffff;
+}
