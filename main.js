@@ -5,21 +5,24 @@
  * Copyright (c) 2026 Gregory Jackson. MIT License.
  *
  * Adds a "Click mode" to Obsidian's graph view:
- *   - Clicking a node opens the note (beside the graph) and keeps the node
- *     highlighted until Escape is pressed or another node is clicked.
- *   - Opening a note any other way (file explorer, a link, quick switcher)
- *     selects that note's node, as if it had been clicked.
- *   - Hovering a node shows its label as if it were clicked, without
- *     changing the selection.
+ *   - Clicking a node selects it, opens its note beside the graph and glides
+ *     the camera to it; the highlight stays until Escape or another click.
+ *   - Ctrl/Cmd-click selects several nodes: only they, the nodes they all
+ *     share and the connections between them stay lit.
+ *   - Graph nodes, files in the file explorer and links in notes all follow
+ *     the same selection rules; the notes pane holds exactly the selection.
+ *   - Notes open in Reading view; click in to edit, Escape to return.
+ *   - Hovering a node shows its label as if it were clicked.
  *   - Lines from the highlighted node take the colour of the node at the
  *     other end; grouped nodes keep their group colour when highlighted.
  *   - The open note's ring is black (light mode) or white (dark mode).
- *   - Global graph tabs are kept pinned.
+ *   - The camera keeps the graph steady when the notes pane opens or closes.
  *
  * Obsidian has no public API for the graph renderer, so this hooks into
  * internals (view.renderer, renderer.highlightNode, renderer.onNodeClick,
- * node.render, node.circle, link display objects). Every hook is guarded,
- * and the original behaviour is restored on unload.
+ * renderer.onResize, node.render, node.circle, link display objects), and
+ * wraps workspace.getLeaf and workspace.trigger. Every hook is guarded, and
+ * the original behaviour is restored on unload.
  */
 
 const { Plugin, PluginSettingTab, Setting, Notice, setIcon, Keymap, TFile } = require('obsidian');
@@ -30,6 +33,9 @@ const DEFAULT_SETTINGS = {
   followActiveFile: true,         // opening a note selects its node
   hoverWhenNothingSelected: true, // in click mode, hover still highlights while nothing is selected
   openInOtherPane: true,          // open notes outside the graph's tab group so the graph stays visible
+  tabsFollowSelection: true,      // Click mode: the notes pane's tabs are exactly the selected notes
+  previewOnHover: false,          // allow Obsidian's note preview (Ctrl-hover) from graph nodes and the file explorer
+  openInReadingView: true,        // notes opened beside the graph start in Reading view
   centerOnSelect: true,           // pan the graph so a newly selected node moves to the centre
   hoverLabelStyle: 'graph',       // 'graph' = the graph's own node label, 'tooltip' = a box by the cursor
   colorLinks: true,               // highlighted node's lines take the colour of the node at the other end
@@ -57,10 +63,48 @@ function mixColor(a, b, t) {
 }
 
 module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
+  // A small startup log is kept in the plugin's data file (when Obsidian
+  // started the plugin, how far it got, any errors), so diagnostics taken in a
+  // later session can show what happened in an earlier startup.
   async onload() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    try {
+      await this.loadInner();
+      this.logStage('loaded');
+    } catch (e) {
+      this.noteError('startup', e);
+    }
+  }
+
+  logStage(stage) {
+    if (!this.startupLog) return;
+    this.startupLog.stages.push(`${stage}@${Date.now() - this.startupLog.t0}ms`);
+    this.persistLog();
+  }
+
+  persistLog() {
+    if (!this.settings) return;
+    try {
+      const data = Object.assign({}, this.settings, { _startupLog: { previous: this.previousStartupLog || null, current: this.startupLog } });
+      Promise.resolve(this.saveData(data)).catch(() => {});
+    } catch (e) { /* ignore */ }
+  }
+
+  async loadInner() {
+    this.loadErrors = [];
+    let saved = null;
+    try { saved = await this.loadData(); } catch (e) { this.noteError('loadData', e); }
+    this.previousStartupLog = saved && saved._startupLog ? saved._startupLog.current : null;
+    this.startupLog = { started: new Date().toISOString(), t0: Date.now(), obsidianStarting: !this.app.workspace.layoutReady, stages: ['start'], errors: [] };
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
+    delete this.settings._startupLog;
     delete this.settings.openOnDoubleClick; // removed in 1.1
+    this.persistLog();
     this.selectedId = null;
+    this.selection = []; // selected node ids; the first is the primary (Obsidian's highlight)
+    this.lastLayout = new Map(); // renderer -> size, pan and screen position as of the last frame
+    this.editingLeaves = new WeakMap(); // notes-pane leaf -> path the user clicked into to edit
+    this.multiCache = new WeakMap(); // renderer -> cached lit sets for a multi-selection
+    this.protoRestores = [];
     this.hooks = new Map(); // renderer -> hook state
     // Tracked per plugin instance (not as flags on Obsidian's objects) so that
     // disabling and re-enabling the plugin always starts clean.
@@ -95,13 +139,33 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
     this.addCommand({ id: 'clear-selection', name: 'Clear graph selection', callback: () => this.setSelected(null) });
     this.addCommand({ id: 'copy-diagnostics', name: 'Copy diagnostics (for troubleshooting)', callback: () => this.copyDiagnostics() });
 
-    this.app.workspace.onLayoutReady(() => { this.syncMarkerClass(); this.scan(); });
+    this.safely('ring colour', () => this.syncMarkerClass()); // as early as possible, before the graph is set up
+    this.app.workspace.onLayoutReady(() => {
+      this.logStage('layout-ready');
+      this.safely('scan', () => this.scan());
+      this.safely('ring colour', () => this.syncMarkerClass(true));
+    });
     this.registerEvent(this.app.workspace.on('layout-change', () => this.scan()));
     this.registerEvent(this.app.workspace.on('active-leaf-change', () => this.scan()));
     this.registerEvent(this.app.workspace.on('css-change', () => this.updateSelectedStyle()));
     this.registerEvent(this.app.workspace.on('file-open', (file) => {
-      if (file && this.settings.mode === 'click' && this.settings.followActiveFile) this.setSelected(file.path);
+      this.applyReadingView(file);
+      if (!file || this.settings.mode !== 'click' || !this.settings.followActiveFile) return;
+      const g = this.lastGetLeaf;
+      const modOpen = !!(g && (g.mode === 'tab' || g.mode === true) && now() - g.time < 1500);
+      this.lastGetLeaf = null;
+      if (modOpen) {
+        // Ctrl/Cmd-click outside the graph (e.g. the file explorer): add to / remove from the selection.
+        const added = this.toggleInSelection(file.path);
+        if (this.tabsManaged()) this.syncTabs(null, added ? file.path : null);
+        return;
+      }
+      if (this.selection.includes(file.path)) return; // already selected (e.g. switching between its tabs)
+      this.setSelected(file.path);
+      if (this.tabsManaged()) this.syncTabs(null, null);
     }));
+
+    this.safely('workspace routing', () => this.patchWorkspace());
 
     // Capture phase so the graph canvas can't swallow the event before we see it.
     const track = (evt) => {
@@ -109,22 +173,78 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
       if (this.labelEl.isShown()) this.positionLabel();
     };
     this.registerDomEvent(document, 'pointermove', track, { capture: true });
+    this.registerDomEvent(document, 'pointerdown', () => { this.pointerHeld = true; }, { capture: true });
+    this.registerDomEvent(document, 'pointerup', () => { this.pointerHeld = false; }, { capture: true });
+    this.registerDomEvent(document, 'pointercancel', () => { this.pointerHeld = false; }, { capture: true });
     this.registerDomEvent(document, 'mousemove', track, { capture: true });
 
     this.registerDomEvent(document, 'keydown', (evt) => {
-      if (evt.key !== 'Escape' || !this.selectedId || this.settings.mode !== 'click') return;
+      if (evt.key !== 'Escape') return;
       if (document.querySelector('.modal-container, .menu, .suggestion-container, .prompt')) return;
-      this.setSelected(null);
+      const t = evt.target;
+      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ''))) {
+        // Typing in a note beside the graph: Escape returns it to Reading view.
+        if (this.settings.openInReadingView) {
+          const leaf = this.leafContaining(t);
+          if (leaf && this.inNotesPane(leaf) && leaf.view && typeof leaf.view.getMode === 'function' && leaf.view.getMode() === 'source') {
+            this.editingLeaves.delete(leaf);
+            this.setLeafMode(leaf, 'preview');
+          }
+        }
+        return;
+      }
+      if (!this.selection.length || this.settings.mode !== 'click') return;
+      this.clearSelection();
     });
+
+    // Click mode: clicks on files in the file explorer and links in notes follow
+    // the same selection rules as graph nodes.
+    this.registerDomEvent(document, 'click', (evt) => this.onNoteClick(evt), { capture: true });
+
+    // Clicking into a note shown in Reading view beside the graph switches it to editing.
+    this.registerDomEvent(document, 'click', (evt) => {
+      if (!this.settings.openInReadingView) return;
+      const t = evt.target;
+      if (!t || typeof t.closest !== 'function' || !t.closest('.markdown-reading-view')) return;
+      if (t.closest('a, .internal-link, .external-link, .tag, input, button, .internal-embed, .task-list-item-checkbox, .collapse-indicator, .heading-collapse-indicator')) return;
+      const sel = window.getSelection && window.getSelection();
+      if (sel && !sel.isCollapsed) return; // selecting text, not clicking in
+      const leaf = this.leafContaining(t);
+      if (!leaf || !this.inNotesPane(leaf) || !leaf.view || typeof leaf.view.getMode !== 'function' || leaf.view.getMode() !== 'preview') return;
+      this.editingLeaves.set(leaf, this.leafPath(leaf));
+      this.setLeafMode(leaf, 'source').then(() => { try { if (leaf.view.editor) leaf.view.editor.focus(); } catch (e) { /* ignore */ } });
+    });
+
+    // 2/3. Closing a selected note's tab deselects that node.
+    this.registerEvent(this.app.workspace.on('layout-change', () => {
+      window.clearTimeout(this.closedTimer);
+      this.closedTimer = window.setTimeout(() => this.checkClosedTabs(), 120);
+    }));
 
     // Renderers and their nodes are created or replaced over time (deferred
     // tabs, graph refreshes), so re-check regularly. This is cheap.
     this.registerInterval(window.setInterval(() => this.scan(), 700));
   }
 
+  noteError(where, e) {
+    this.loadErrors = this.loadErrors || [];
+    const msg = `${where}: ${e && e.message ? e.message : e}`;
+    this.loadErrors.push(msg);
+    if (this.startupLog) { this.startupLog.errors.push(msg); this.persistLog(); }
+    console.error(`Intuitive Graph Navigation (${where}):`, e);
+  }
+
+  safely(where, fn) {
+    try { return fn(); } catch (e) { this.noteError(where, e); return undefined; }
+  }
+
   onunload() {
     this.unloading = true;
+    for (const restore of (this.wsRestores || [])) { try { restore(); } catch (e) { /* ignore */ } }
+    this.wsRestores = [];
     this.stopPans();
+    for (const restore of this.protoRestores) { try { restore(); } catch (e) { /* ignore */ } }
+    this.protoRestores = [];
     this.syncMarkerClass();
     this.releaseText();
     if (this.labelEl) this.labelEl.remove();
@@ -142,7 +262,7 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
   }
 
   async saveSettings() {
-    await this.saveData(this.settings);
+    await this.saveData(Object.assign({}, this.settings, { _startupLog: { previous: this.previousStartupLog || null, current: this.startupLog || null } }));
     this.refreshIndicators();
     this.scan();
     this.redrawAll();
@@ -161,6 +281,7 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
       const file = this.app.workspace.getActiveFile();
       if (file) this.selectedId = file.path;
     }
+    this.selection = this.selectedId ? [this.selectedId] : [];
     this.refreshIndicators();
     this.redrawAll();
     this.saveSettings();
@@ -178,12 +299,49 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
   }
 
   setSelected(id) {
-    const changed = id !== this.selectedId;
+    if (!id) this.stopPans(); // nothing to glide to: the graph should stay where it is
+    const changed = id !== this.selectedId || this.selection.length > 1;
     this.selectedId = id;
+    this.selection = id ? [id] : [];
     if (id === null) for (const hook of this.hooks.values()) hook.store = null;
     this.refreshIndicators();
     this.redrawAll();
-    if (id && changed && this.settings.mode === 'click' && this.settings.centerOnSelect) this.centerOn(id);
+    if (id && changed && this.settings.mode === 'click' && this.settings.centerOnSelect) this.centerOn([id]);
+  }
+
+  // Clear the selection the way Escape does: deselect everything, close the
+  // selected notes' tabs, and make the graph the active panel again (so Obsidian
+  // stops treating a closed note as the open one, e.g. after a click in the file
+  // explorer made the explorer the active panel).
+  clearSelection() {
+    const managed = this.tabsManaged();
+    const graphLeaf = this.graphLeafForTabs(null);
+    this.setSelected(null);
+    if (managed) this.syncTabs(null, null);
+    // Always switch: a panel in the sidebar (like the file explorer) can be the
+    // active one without the main area noticing. Repeated just after the click
+    // has finished, in case the clicked panel takes focus back.
+    const ws = this.app.workspace;
+    if (!graphLeaf || !graphLeaf.view) return;
+    const activate = () => { try { ws.setActiveLeaf(graphLeaf, { focus: true }); } catch (e) { /* ignore */ } };
+    activate();
+    window.setTimeout(activate, 0);
+  }
+
+  // Ctrl/Cmd-click in Click mode: add the node to the selection, or remove it
+  // if it's already selected. Returns true if the node was added.
+  toggleInSelection(id) {
+    if (!this.selection.length) { this.setSelected(id); return true; }
+    const i = this.selection.indexOf(id);
+    const added = i < 0;
+    if (added) this.selection.push(id);
+    else this.selection.splice(i, 1);
+    this.selectedId = this.selection[0] || null;
+    if (!this.selectedId) { this.stopPans(); for (const hook of this.hooks.values()) hook.store = null; }
+    this.refreshIndicators();
+    this.redrawAll();
+    if (this.selection.length && this.settings.centerOnSelect) this.centerOn(this.selection);
+    return added;
   }
 
   // ------------------------------------------------------------------ camera
@@ -193,19 +351,65 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
   // The camera glides there over PAN_MS, following the node if it is still
   // moving as the graph settles.
 
-  centerOn(id) {
-    for (const renderer of this.hooks.keys()) {
-      const node = this.lookupNode(renderer, id);
-      if (!node || typeof renderer.panX !== 'number' || typeof renderer.scale !== 'number') continue;
-      this.startPan(renderer, node);
-    }
+  // Glide to the centre of the given nodes (one node, or a multi-selection).
+  // Starts on the next frame. If the click has just opened the notes pane, it
+  // first waits until the pane has appeared and the graph has finished
+  // resizing (the graph stays still on screen meanwhile), then glides.
+  centerOn(ids) {
+    this.lastCenter = { ids: ids.slice(), time: now() };
+    if (this.centerWait) window.cancelAnimationFrame(this.centerWait);
+    let frames = 0;
+    const go = () => {
+      this.centerWait = 0;
+      // Apply any resize correction still pending, so the glide starts from
+      // where the node was on screen before the notes pane opened.
+      for (const renderer of this.hooks.keys()) this.checkResize(renderer);
+      for (const renderer of this.hooks.keys()) {
+        const nodes = ids.map((id) => this.lookupNode(renderer, id)).filter(Boolean);
+        if (!nodes.length || typeof renderer.panX !== 'number' || typeof renderer.scale !== 'number') continue;
+        this.startPan(renderer, nodes);
+      }
+    };
+    const wait = () => {
+      if (this.graphResizing() && frames++ < 45) { this.centerWait = window.requestAnimationFrame(wait); return; }
+      go();
+    };
+    this.centerWait = window.requestAnimationFrame(wait);
   }
 
-  panTarget(renderer, node) {
+  // True while a graph's on-screen size has changed but the graph itself
+  // hasn't caught up yet (e.g. the notes pane is opening).
+  // A resize is under way when the graph's on-screen width has changed but the
+  // graph's own size hasn't changed since.
+  graphResizing() {
+    for (const renderer of this.hooks.keys()) {
+      if (!Number.isFinite(renderer.width)) continue;
+      const rect = this.viewRect(renderer);
+      if (!rect.width) continue;
+      const last = this.lastLayout.get(renderer);
+      if (last && Number.isFinite(last.pairWidth)) {
+        if (renderer.width === last.w && Math.abs(rect.width - last.pairWidth) > 1) return true;
+      } else if (Math.abs(renderer.width / rect.k - rect.width) > 1) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  panTarget(renderer, nodes) {
     const w = renderer.width;
     const h = renderer.height;
     if (typeof w !== 'number' || typeof h !== 'number' || !w || !h) return null;
-    return { x: w / 2 - node.x * renderer.scale, y: h / 2 - node.y * renderer.scale };
+    let x = 0;
+    let y = 0;
+    for (const n of nodes) {
+      if (!Number.isFinite(n.x) || !Number.isFinite(n.y)) return null;
+      x += n.x;
+      y += n.y;
+    }
+    x /= nodes.length;
+    y /= nodes.length;
+    return { x: w / 2 - x * renderer.scale, y: h / 2 - y * renderer.scale };
   }
 
   setPan(renderer, x, y) {
@@ -217,29 +421,157 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
     if (typeof renderer.changed === 'function') renderer.changed();
   }
 
-  startPan(renderer, node) {
+  // ------------------------------------------------------------------ screen geometry
+  //
+  // Renderer units are screen pixels times a fixed factor k (1, or the device
+  // pixel ratio). A graph point p is drawn at screen position
+  //   rect.left + (p * scale + pan) / k.
+
+  unitFactor(renderer, rect) {
+    const dpr = window.devicePixelRatio || 1;
+    if (!rect.width || !renderer.width) return 1;
+    const ratio = renderer.width / rect.width;
+    return Math.abs(ratio - dpr) < Math.abs(ratio - 1) ? dpr : 1;
+  }
+
+  viewRect(renderer) {
+    const el = renderer.interactiveEl || renderer.containerEl;
+    let r = { left: 0, top: 0, width: 0, height: 0 };
+    try { if (el && el.getBoundingClientRect) r = el.getBoundingClientRect(); } catch (e) { /* ignore */ }
+    const rect = { left: r.left || 0, top: r.top || 0, width: r.width || 0, height: r.height || 0 };
+    rect.k = this.unitFactor(renderer, rect);
+    return rect;
+  }
+
+  toScreen(renderer, p, rect) {
+    return { x: rect.left + (p.x * renderer.scale + renderer.panX) / rect.k, y: rect.top + (p.y * renderer.scale + renderer.panY) / rect.k };
+  }
+
+  // Pan so graph point p is drawn at screen position s.
+  placeAt(renderer, p, s, rect) {
+    this.setPan(renderer, (s.x - rect.left) * rect.k - p.x * renderer.scale, (s.y - rect.top) * rect.k - p.y * renderer.scale);
+  }
+
+  // The middle of the graph area as it appears on screen right now. This uses
+  // the on-screen size, which changes the moment the screen splits; the graph's
+  // own recorded size only catches up a few frames later.
+  screenCentre(renderer, rect) {
+    const w = rect.width || renderer.width / rect.k;
+    const h = rect.height || renderer.height / rect.k;
+    return { x: rect.left + w / 2, y: rect.top + h / 2 };
+  }
+
+  // The glide moves the node across the screen to the middle of the graph.
+  // If the graph is resized mid-glide (the screen splits to show the note, or
+  // un-splits), the node keeps its position on screen at that moment and the
+  // glide carries on from there to the new middle - no jump.
+  startPan(renderer, nodes) {
     if (!this.pans) this.pans = new Map();
     const prev = this.pans.get(renderer);
     if (prev) window.cancelAnimationFrame(prev.frame);
-    const from = { x: renderer.panX, y: renderer.panY };
-    const start = now();
-    const pan = { frame: 0 };
+    const point = () => {
+      let x = 0;
+      let y = 0;
+      for (const n of nodes) {
+        if (!Number.isFinite(n.x) || !Number.isFinite(n.y)) return null;
+        x += n.x;
+        y += n.y;
+      }
+      return { x: x / nodes.length, y: y / nodes.length };
+    };
+    const p0 = point();
+    if (!p0 || ![renderer.scale, renderer.panX, renderer.panY, renderer.width, renderer.height].every(Number.isFinite)) return;
+    const rect0 = this.viewRect(renderer);
+    const pan = { frame: 0, from: this.toScreen(renderer, p0, rect0), start: now(), firstStart: now(), duration: PAN_MS, layout: null, last: null, point };
     this.pans.set(renderer, pan);
+    if (!this.lastLayout.has(renderer)) this.recordLayout(renderer, rect0);
     const tick = () => {
-      const target = this.panTarget(renderer, node);
-      if (!target || !Number.isFinite(node.x) || !Number.isFinite(node.y)) { this.pans.delete(renderer); return; }
-      const p = Math.min(1, (now() - start) / PAN_MS);
-      const e = 1 - Math.pow(1 - p, 3); // ease out
-      try {
-        this.setPan(renderer, from.x + (target.x - from.x) * e, from.y + (target.y - from.y) * e);
-      } catch (err) { this.pans.delete(renderer); return; }
-      if (p < 1) pan.frame = window.requestAnimationFrame(tick);
+      const p = point();
+      if (!p) { this.pans.delete(renderer); return; }
+      const rect = this.viewRect(renderer);
+      const layout = `${renderer.width}x${renderer.height}@${rect.left},${rect.top},${rect.width}x${rect.height}`;
+      if (pan.layout && pan.layout !== layout && pan.last) {
+        // Resized: carry on from where the node is on screen right now.
+        pan.from = pan.last;
+        pan.start = now();
+        pan.duration = Math.max(250, PAN_MS - (now() - pan.firstStart));
+      }
+      pan.layout = layout;
+      const t = Math.min(1, (now() - pan.start) / pan.duration);
+      const e = 1 - Math.pow(1 - t, 3); // ease out
+      const end = this.screenCentre(renderer, rect);
+      const s2 = { x: pan.from.x + (end.x - pan.from.x) * e, y: pan.from.y + (end.y - pan.from.y) * e };
+      try { this.placeAt(renderer, p, s2, rect); } catch (err) { this.pans.delete(renderer); return; }
+      pan.last = s2;
+      this.recordLayout(renderer, rect);
+      if (t < 1) pan.frame = window.requestAnimationFrame(tick);
       else this.pans.delete(renderer);
     };
     pan.frame = window.requestAnimationFrame(tick);
   }
 
+  // ------------------------------------------------------------------ resize steadiness
+  //
+  // The plugin remembers each graph view's size, pan and screen position as of
+  // the last frame. When the size changes, before the frame is drawn:
+  //   - during a glide, the node being glided to stays where it was on screen
+  //     (the glide then carries on from there);
+  //   - otherwise, everything stays where it was on screen.
+
+  recordLayout(renderer, rect) {
+    rect = rect || this.viewRect(renderer);
+    const prev = this.lastLayout.get(renderer);
+    // The on-screen width that goes with the graph's current size: updated
+    // whenever the graph's own size changes. (Any fixed difference between the
+    // two, e.g. a border, is therefore never mistaken for a resize.)
+    const pairWidth = !prev || prev.w !== renderer.width || prev.h !== renderer.height ? rect.width : prev.pairWidth;
+    this.lastLayout.set(renderer, { w: renderer.width, h: renderer.height, panX: renderer.panX, panY: renderer.panY, left: rect.left, top: rect.top, pairWidth });
+  }
+
+  // Returns true if it corrected a resize.
+  checkResize(renderer) {
+    if (![renderer.width, renderer.height, renderer.panX, renderer.panY, renderer.scale].every(Number.isFinite)) return false;
+    const rect = this.viewRect(renderer);
+    const last = this.lastLayout.get(renderer);
+    let corrected = false;
+    if (last && (renderer.width !== last.w || renderer.height !== last.h)) {
+      const pan = this.pans && this.pans.get(renderer);
+      try {
+        if (pan) {
+          const p = pan.point && pan.point();
+          const s2 = pan.last || pan.from;
+          if (p && s2) this.placeAt(renderer, p, s2, rect);
+        } else {
+          this.setPan(renderer, last.panX + (last.left - rect.left) * rect.k, last.panY + (last.top - rect.top) * rect.k);
+        }
+        corrected = true;
+      } catch (e) { /* ignore */ }
+    }
+    this.recordLayout(renderer, rect);
+    return corrected;
+  }
+
+  // Remember the current layout just before the plugin itself resizes the graph
+  // (opening or closing the notes pane).
+  snapshotViews() {
+    for (const renderer of this.hooks.keys()) {
+      if ([renderer.width, renderer.height, renderer.panX, renderer.panY].every(Number.isFinite)) this.recordLayout(renderer);
+    }
+  }
+
+  // Backup for graph versions where the resize/draw steps can't be wrapped:
+  // check over the next few frames.
+  onGraphResize(renderer) {
+    let frames = 0;
+    const watch = () => {
+      if (this.checkResize(renderer)) return;
+      if (++frames < 30) window.requestAnimationFrame(watch);
+    };
+    watch();
+  }
+
   stopPans() {
+    if (this.centerWait) { window.cancelAnimationFrame(this.centerWait); this.centerWait = 0; }
     if (!this.pans) return;
     for (const pan of this.pans.values()) window.cancelAnimationFrame(pan.frame);
     this.pans.clear();
@@ -261,6 +593,8 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
   // selected, Obsidian sends an "unhover" straight after every hover.
   setHover(renderer, id, source) {
     if (source) this.signals[source]++;
+    // While dragging (mouse button held), don't reveal the names of nodes passed over.
+    if (id && (this.pointerHeld || (renderer && renderer.dragNode))) id = null;
     this.hoverId = id || null;
     this.hoverRenderer = id ? renderer : null;
     this.updateSelectedStyle();
@@ -275,7 +609,7 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
     const renderer = this.hoverRenderer;
     const selected = renderer ? this.lookupNode(renderer, this.selectedId) : null;
     // Obsidian already labels the highlighted node, so only add a label where it wouldn't.
-    if (selected && id === selected.id) return hideAll();
+    if (selected && (id === selected.id || this.selection.includes(id))) return hideAll();
     if (!selected && this.settings.hoverWhenNothingSelected) return hideAll();
     const node = renderer ? this.lookupNode(renderer, id) : null;
 
@@ -568,6 +902,107 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
     } catch (e) { /* ignore */ }
   }
 
+  // ------------------------------------------------------------------ multi-selection
+  //
+  // Obsidian can only highlight one node. With several selected, each node and
+  // line is drawn with a stand-in "highlighted node" chosen so Obsidian lights
+  // exactly the right things:
+  //   - a selected node is drawn as the highlighted node (lit, name shown);
+  //   - a shared node (connected to every selected node) is drawn next to a
+  //     selected node (lit), and its name is then hidden;
+  //   - anything else is drawn against a selected node it isn't connected to
+  //     (dimmed);
+  //   - a line is lit if it joins two selected nodes, or a selected node and a
+  //     shared node.
+
+  multiState(renderer) {
+    if (this.settings.mode !== 'click' || this.selection.length < 2 || !renderer) return null;
+    const links = Array.isArray(renderer.links) ? renderer.links : [];
+    const key = `${this.selection.join('\n')}#${links.length}`;
+    const cached = this.multiCache.get(renderer);
+    if (cached && cached.key === key && cached.links === links) return cached.state;
+
+    const selectedList = this.selection.map((id) => this.lookupNode(renderer, id)).filter(Boolean);
+    let state = null;
+    if (selectedList.length >= 2) {
+      const adj = new Map();
+      const add = (a, b) => { if (!adj.has(a)) adj.set(a, new Set()); adj.get(a).add(b); };
+      for (const l of links) {
+        const a = this.endNode(renderer, l.source);
+        const b = this.endNode(renderer, l.target);
+        if (a && b && a !== b) { add(a, b); add(b, a); }
+      }
+      const selected = new Set(selectedList);
+      const shared = new Set();
+      const first = adj.get(selectedList[0]) || new Set();
+      for (const n of first) {
+        if (selected.has(n)) continue;
+        if (selectedList.every((sNode) => (adj.get(sNode) || new Set()).has(n))) shared.add(n);
+      }
+      state = { selectedList, selected, shared, adj };
+    }
+    this.multiCache.set(renderer, { key, links, state });
+    return state;
+  }
+
+  // A selected node that `node` isn't connected to (so Obsidian dims `node`).
+  dimmingStandIn(state, node, exclude) {
+    for (const sNode of state.selectedList) {
+      if (sNode === node || (exclude && exclude.includes(sNode))) continue;
+      if (!(state.adj.get(sNode) || new Set()).has(node)) return sNode;
+    }
+    return state.selectedList[0];
+  }
+
+  wrapProto(obj, name, make) {
+    let proto = obj && Object.getPrototypeOf(obj);
+    while (proto && !Object.prototype.hasOwnProperty.call(proto, name)) proto = Object.getPrototypeOf(proto);
+    if (!proto || typeof proto[name] !== 'function' || this.wrappedFns.has(proto[name])) return;
+    const orig = proto[name];
+    const wrapped = make(orig);
+    this.wrappedFns.add(wrapped);
+    proto[name] = wrapped;
+    this.protoRestores.push(() => { if (proto[name] === wrapped) proto[name] = orig; });
+  }
+
+  wrapMultiRender(renderer) {
+    const plugin = this;
+    const node0 = Array.isArray(renderer.nodes) ? renderer.nodes[0] : null;
+    if (node0) {
+      this.wrapProto(node0, 'render', (orig) => function () {
+        const r = this.renderer;
+        const state = plugin.highlightOverride ? null : plugin.multiState(r);
+        if (!state) return orig.apply(this, arguments);
+        const isShared = state.shared.has(this);
+        plugin.highlightOverride = state.selected.has(this) ? this : (isShared ? state.selectedList[0] : plugin.dimmingStandIn(state, this));
+        try {
+          return orig.apply(this, arguments);
+        } finally {
+          plugin.highlightOverride = null;
+          // Shared nodes are lit but unnamed (unless being hovered).
+          if (isShared && this.text && !(plugin.forcedText && plugin.forcedText.node === this)) {
+            try { this.text.alpha = 0; } catch (e) { /* ignore */ }
+          }
+        }
+      });
+    }
+    const link0 = Array.isArray(renderer.links) ? renderer.links[0] : null;
+    if (link0) {
+      this.wrapProto(link0, 'render', (orig) => function () {
+        const src = this.source;
+        const r = this.renderer || (src && src.renderer) || (this.target && this.target.renderer);
+        const state = plugin.highlightOverride ? null : plugin.multiState(r);
+        if (!state) return orig.apply(this, arguments);
+        const a = plugin.endNode(r, this.source);
+        const b = plugin.endNode(r, this.target);
+        const lit = (state.selected.has(a) && (state.selected.has(b) || state.shared.has(b)))
+          || (state.selected.has(b) && state.shared.has(a));
+        plugin.highlightOverride = lit ? (state.selected.has(a) ? a : b) : plugin.dimmingStandIn(state, null, [a, b]);
+        try { return orig.apply(this, arguments); } finally { plugin.highlightOverride = null; }
+      });
+    }
+  }
+
   // ------------------------------------------------------------------ group colour first
   //
   // Obsidian replaces a node's group colour with the accent colour when it's
@@ -625,6 +1060,7 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
   // True for the highlighted node (this includes a hovered node being drawn
   // as highlighted) and for the open note's node.
   isSpecialNode(renderer, node) {
+    if (this.settings.mode === 'click' && this.selection.length > 1 && node && this.selection.includes(node.id)) return true;
     let hl = null;
     try { hl = typeof renderer.getHighlightNode === 'function' ? renderer.getHighlightNode() : renderer.highlightNode; } catch (e) { hl = null; }
     if (hl === node) return true;
@@ -700,14 +1136,65 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
   // styles.css (via a body class): black in light mode, white in dark mode.
 
   // styles.css recolours Obsidian's open-note ring only while this class is on <body>.
-  syncMarkerClass() {
+  syncMarkerClass(force) {
     const on = !!this.settings.styleSelected && !this.unloading;
     const body = document.body;
     if (!body || !body.classList) return;
-    if (body.classList.contains('gcs-bw-nodes') === on) return;
+    if (body.classList.contains('gcs-bw-nodes') === on && !force) return;
     body.classList.toggle('gcs-bw-nodes', on);
-    // Ask Obsidian to re-read its graph colours from CSS.
-    try { this.app.workspace.trigger('css-change'); } catch (e) { /* ignore */ }
+    this.applyRingColour(on);
+  }
+
+  // The ring colour Obsidian would read right now, via a probe element.
+  probeRingColour() {
+    const el = document.body.createDiv({ cls: 'graph-view color-circle' });
+    el.style.display = 'none';
+    let colour = '';
+    try { colour = getComputedStyle(el).color; } catch (e) { colour = ''; }
+    el.remove();
+    return colour;
+  }
+
+  // 1. Wait until the new ring colour is in effect (the plugin's stylesheet can
+  //    load a moment after the plugin itself).
+  // 2. Tell Obsidian styles changed, so the graph re-reads its colours.
+  // 3. Check the colour each graph is actually using; reopen only graphs that
+  //    still have the old one.
+  applyRingColour(on) {
+    const dark = document.body.classList.contains('theme-dark');
+    const wantCss = dark ? 'rgb(255, 255, 255)' : 'rgb(0, 0, 0)';
+    const wantRgb = dark ? 0xffffff : 0x000000;
+    const start = now();
+    const attempt = () => {
+      let ready;
+      try { ready = on ? this.probeRingColour() === wantCss : this.probeRingColour() !== wantCss; } catch (e) { ready = true; }
+      if (!ready && now() - start < 3000) { window.setTimeout(attempt, 100); return; }
+      try { this.app.workspace.trigger('css-change'); } catch (e) { /* ignore */ }
+      window.setTimeout(() => {
+        const stale = [];
+        for (const type of GRAPH_TYPES) {
+          for (const leaf of this.app.workspace.getLeavesOfType(type)) {
+            const c = leaf.view && leaf.view.renderer && leaf.view.renderer.colors && leaf.view.renderer.colors.circle;
+            if (c && typeof c.rgb === 'number' && (c.rgb === wantRgb) !== on) stale.push(leaf);
+          }
+        }
+        if (stale.length) this.reopenGraphViews(stale);
+      }, 250);
+    };
+    window.setTimeout(attempt, 50);
+  }
+
+  async reopenGraphViews(leaves) {
+    for (const leaf of leaves) {
+      try {
+        const state = leaf.getViewState();
+        await leaf.setViewState({ type: 'empty', state: {} });
+        await leaf.setViewState(state);
+      } catch (e) {
+        console.error('Intuitive Graph Navigation: could not reopen the graph view', e);
+      }
+    }
+    if (!this.unloading) this.scan();
   }
 
   updateSelectedStyle() {
@@ -762,6 +1249,10 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
   // ------------------------------------------------------------------ hooking
 
   scan() {
+    this.scanInner();
+  }
+
+  scanInner() {
     const live = new Set();
     for (const type of GRAPH_TYPES) {
       for (const leaf of this.app.workspace.getLeavesOfType(type)) {
@@ -779,15 +1270,29 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
         this.wrapCallback(renderer, hook, 'onNodeClick', (orig, self, args) => this.handleNodeClick(renderer, hook, orig, self, args));
         this.wrapCallback(renderer, hook, 'onNodeHover', (orig, self, args) => {
           this.signals.onNodeHover++;
+          // Obsidian uses this to show a note preview when Ctrl is held.
+          if (!this.settings.previewOnHover) return undefined;
           return orig && orig.apply(self, args);
         });
         this.wrapCallback(renderer, hook, 'onNodeUnhover', (orig, self, args) => {
           hook.store = null;
           return orig && orig.apply(self, args);
         });
+        // Correct for resizes right inside Obsidian's own resize and drawing
+        // steps, so a resized frame is never drawn uncorrected.
+        this.wrapCallback(renderer, hook, 'onResize', (orig, self, args) => {
+          const res = orig && orig.apply(self, args);
+          this.checkResize(renderer);
+          return res;
+        });
+        this.wrapCallback(renderer, hook, 'renderCallback', (orig, self, args) => {
+          this.checkResize(renderer);
+          return orig && orig.apply(self, args);
+        });
         this.attachCircleListeners(renderer);
         this.hookLinks(renderer);
         this.hookCircleTints(renderer);
+        this.wrapMultiRender(renderer);
       }
     }
     for (const renderer of [...this.hooks.keys()]) if (!live.has(renderer)) this.hooks.delete(renderer);
@@ -860,6 +1365,13 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
     const container = leaf.view && leaf.view.containerEl;
     if (container) {
       this.registerDomEvent(container, 'mouseleave', () => { hook.store = null; this.setHover(renderer, null); });
+      // Opening the first note splits the screen and shrinks the graph after the
+      // camera has aimed; re-aim when that happens.
+      if (typeof ResizeObserver !== 'undefined') {
+        const ro = new ResizeObserver(() => this.onGraphResize(renderer));
+        ro.observe(container);
+        this.register(() => ro.disconnect());
+      }
     }
 
     this.hooks.set(renderer, hook);
@@ -941,15 +1453,340 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
     const [evt, id] = args;
     const callOriginal = () => orig && orig.apply(self, args);
 
-    if (this.settings.mode !== 'click') return callOriginal();
+    const mod = !!(evt && Keymap.isModEvent(evt));
+
+    if (this.settings.mode !== 'click') {
+      // Hover mode: Ctrl/Cmd-click opens a new tab beside the graph instead of on the pinned graph.
+      if (mod && this.settings.openInOtherPane && this.openOutsideGraph(hook.leaf, id, true)) return;
+      return callOriginal();
+    }
+
+    this.lastGraphLeaf = hook.leaf;
+    const managed = this.tabsManaged() && this.isFile(id);
+
+    if (mod) {
+      // Click mode: Ctrl/Cmd-click adds to (or removes from) the selection.
+      const added = this.toggleInSelection(id);
+      if (managed) { this.syncTabs(hook.leaf, added ? id : null); return; }
+      if (!added) return;
+      if (this.settings.openInOtherPane && this.openOutsideGraph(hook.leaf, id, true)) return;
+      return callOriginal();
+    }
+
+    if (this.selection.includes(id)) {
+      // Already selected: keep the selection, bring its note forward, pan to it.
+      if (this.settings.centerOnSelect) this.centerOn([id]);
+      if (managed) { this.syncTabs(hook.leaf, id); return; }
+      if (this.settings.openInOtherPane && this.openOutsideGraph(hook.leaf, id)) return;
+      return callOriginal();
+    }
 
     this.setSelected(id);
-    if (evt && Keymap.isModEvent(evt)) return callOriginal(); // Ctrl/Cmd-click: normal new tab / split
+    if (managed) { this.syncTabs(hook.leaf, id); return; }
     if (this.settings.openInOtherPane && this.openOutsideGraph(hook.leaf, id)) return;
     return callOriginal();
   }
 
-  openOutsideGraph(graphLeaf, path) {
+  // ------------------------------------------------------------------ reading view
+  //
+  // Notes opened beside the graph start in Reading view. Clicking into one
+  // switches it to editing; Escape while editing switches it back.
+
+  readingState() {
+    return this.settings.openInReadingView ? { state: { mode: 'preview' } } : undefined;
+  }
+
+  inNotesPane(leaf) {
+    if (!leaf) return false;
+    const pane = this.notesPaneRef || this.notesPane(this.graphLeafForTabs());
+    return !!pane && leaf.parent === pane;
+  }
+
+  leafContaining(el) {
+    let found = null;
+    this.app.workspace.iterateRootLeaves((leaf) => {
+      if (!found && leaf.view && leaf.view.containerEl && leaf.view.containerEl.contains && leaf.view.containerEl.contains(el)) found = leaf;
+    });
+    return found;
+  }
+
+  setLeafMode(leaf, mode) {
+    const v = leaf && leaf.view;
+    if (!v || typeof v.getMode !== 'function' || typeof v.setState !== 'function' || v.getMode() === mode) return Promise.resolve();
+    try {
+      const state = Object.assign({}, typeof v.getState === 'function' ? v.getState() : {}, { mode });
+      return Promise.resolve(v.setState(state, { history: false }));
+    } catch (e) {
+      return Promise.resolve();
+    }
+  }
+
+  // A note that just opened beside the graph goes to Reading view, unless the
+  // user has clicked into it to edit.
+  applyReadingView(file) {
+    if (!this.settings.openInReadingView || !file) return;
+    const leaf = this.app.workspace.getMostRecentLeaf && this.app.workspace.getMostRecentLeaf();
+    if (!leaf || this.leafPath(leaf) !== file.path || !this.inNotesPane(leaf)) return;
+    if (this.editingLeaves.get(leaf) === file.path) return;
+    this.setLeafMode(leaf, 'preview');
+  }
+
+  // ------------------------------------------------------------------ file explorer and link clicks
+
+  // The note a click on a file-explorer item or a Reading-view link refers to.
+  notePathFromClick(target) {
+    if (!target || typeof target.closest !== 'function') return null;
+    const nav = target.closest('.nav-file-title');
+    if (nav) {
+      const p = nav.getAttribute && nav.getAttribute('data-path');
+      return p && this.isFile(p) ? p : null;
+    }
+    const link = target.closest('a.internal-link, .internal-link');
+    if (link && target.closest('.markdown-reading-view, .markdown-preview-view')) {
+      const href = (link.getAttribute && (link.getAttribute('data-href') || link.getAttribute('href'))) || '';
+      let linkpath = href.split('#')[0].split('|')[0];
+      try { linkpath = decodeURIComponent(linkpath); } catch (e) { /* keep as is */ }
+      if (!linkpath) return null;
+      const leaf = this.leafContaining(link);
+      const source = leaf ? this.leafPath(leaf) || '' : '';
+      const file = this.app.metadataCache && this.app.metadataCache.getFirstLinkpathDest(linkpath, source);
+      return file && file.path ? file.path : null;
+    }
+    return null;
+  }
+
+  // Click mode, files in the file explorer and links in notes (Reading view)
+  // follow the same rules as graph nodes:
+  //   click an unselected note     -> it becomes the only selection, note shown
+  //   click a selected note        -> selection kept, note brought forward, camera to it
+  //   Ctrl-click an unselected note -> added to the selection, note shown
+  //   Ctrl-click a selected note    -> removed from the selection, its tab closed
+  onNoteClick(evt) {
+    if (this.settings.mode !== 'click' || !this.tabsManaged()) return;
+    if (evt.button !== undefined && evt.button !== 0) return; // left button only
+    const path = this.notePathFromClick(evt.target);
+    if (!path) return;
+    evt.preventDefault();
+    evt.stopPropagation();
+    if (evt.stopImmediatePropagation) evt.stopImmediatePropagation();
+    this.lastGetLeaf = null;
+    if (Keymap.isModEvent(evt)) {
+      if (this.selection.length === 1 && this.selection[0] === path) {
+        // Deselecting the last selected note: exactly the same as Escape.
+        this.clearSelection();
+        return;
+      }
+      const added = this.toggleInSelection(path);
+      this.syncTabs(null, added ? path : null);
+    } else if (this.selection.includes(path)) {
+      if (this.settings.centerOnSelect) this.centerOn([path]);
+      this.syncTabs(null, path);
+    } else {
+      this.setSelected(path);
+      this.syncTabs(null, path);
+    }
+  }
+
+  // ------------------------------------------------------------------ workspace routing
+  //
+  // Two small, reversible wrappers on Obsidian's workspace:
+  //   - getLeaf: when the graph tab is active, Obsidian would open notes (from
+  //     the file explorer, quick switcher, etc.) inside the graph's tab group,
+  //     covering the graph. They're sent to the notes pane instead. Whether the
+  //     open was a Ctrl/Cmd-click (new tab) is also noted for the selection.
+  //   - trigger: note previews ('hover-link') from graph nodes and the file
+  //     explorer are dropped unless "Note previews on hover" is on.
+
+  patchWorkspace() {
+    const ws = this.app.workspace;
+    const plugin = this;
+    this.wsRestores = this.wsRestores || [];
+    const wrap = (name, make) => {
+      const orig = ws[name];
+      if (typeof orig !== 'function') return;
+      const wrapped = make(orig);
+      ws[name] = wrapped;
+      this.wsRestores.push(() => { if (ws[name] === wrapped) ws[name] = orig; });
+    };
+    wrap('getLeaf', (orig) => function (newLeaf) {
+      plugin.lastGetLeaf = { mode: newLeaf, time: now() };
+      if (!plugin.redirecting) {
+        const leaf = plugin.redirectLeaf(newLeaf);
+        if (leaf) return leaf;
+      }
+      return orig.apply(this, arguments);
+    });
+    wrap('trigger', (orig) => function (name, info) {
+      if (name === 'hover-link' && !plugin.settings.previewOnHover && info) {
+        const parentType = info.hoverParent && info.hoverParent.getViewType ? info.hoverParent.getViewType() : '';
+        const src = info.source || '';
+        if (src === 'file-explorer' || src === 'graph' || src === 'localgraph' || parentType === 'file-explorer' || GRAPH_TYPES.includes(parentType)) return undefined;
+      }
+      return orig.apply(this, arguments);
+    });
+  }
+
+  // If the active tab is a graph (or shares its tab group), return a leaf in the
+  // notes pane to open into instead; otherwise null (Obsidian decides).
+  redirectLeaf(newLeaf) {
+    if (!this.settings.openInOtherPane || this.unloading) return null;
+    if (newLeaf === 'split' || newLeaf === 'window') return null;
+    const ws = this.app.workspace;
+    const active = ws.getMostRecentLeaf && ws.getMostRecentLeaf();
+    if (!active || !active.getRoot || active.getRoot() !== ws.rootSplit) return null;
+    let graphLeaf = null;
+    for (const g of ws.getLeavesOfType('graph')) if (g === active || g.parent === active.parent) graphLeaf = g;
+    if (!graphLeaf) return null;
+    this.redirecting = true;
+    try {
+      let pane = this.notesPane(graphLeaf);
+      if (!pane) {
+        this.snapshotViews();
+        const leaf = ws.createLeafBySplit(graphLeaf, 'vertical');
+        this.notesPaneRef = leaf.parent;
+        return leaf;
+      }
+      const leaves = (Array.isArray(pane.children) ? pane.children : []).filter((l) => l && l.view);
+      if (!newLeaf) {
+        const reuse = leaves.find((l) => l === ws.getMostRecentLeaf() && !this.isPinnedLeaf(l)) || leaves.find((l) => !this.isPinnedLeaf(l));
+        if (reuse) return reuse;
+      }
+      if (typeof ws.createLeafInParent === 'function') return ws.createLeafInParent(pane, Array.isArray(pane.children) ? pane.children.length : 0);
+      return null;
+    } catch (e) {
+      return null;
+    } finally {
+      this.redirecting = false;
+    }
+  }
+
+  // ------------------------------------------------------------------ tabs follow selection
+  //
+  // In Click mode the notes pane (the tab group where clicked notes open) holds
+  // exactly the selected notes: selecting opens a tab (reusing a spare one),
+  // deselecting closes it. Pinned tabs and non-note views are never touched,
+  // and only the notes pane is managed.
+
+  tabsManaged() {
+    return this.settings.mode === 'click' && this.settings.tabsFollowSelection && this.settings.openInOtherPane;
+  }
+
+  isFile(path) {
+    return this.app.vault.getAbstractFileByPath(path) instanceof TFile;
+  }
+
+  leafPath(leaf) {
+    const f = leaf && leaf.view && leaf.view.file;
+    return f && f.path ? f.path : null;
+  }
+
+  isPinnedLeaf(leaf) {
+    try { return !!leaf.getViewState().pinned; } catch (e) { return false; }
+  }
+
+  graphLeafForTabs(graphLeaf) {
+    if (graphLeaf) return graphLeaf;
+    if (this.lastGraphLeaf && this.lastGraphLeaf.view) return this.lastGraphLeaf;
+    const leaves = this.app.workspace.getLeavesOfType('graph');
+    return leaves && leaves[0] ? leaves[0] : null;
+  }
+
+  // The tab group a normal click would open notes in, or null.
+  notesPane(graphLeaf) {
+    const ws = this.app.workspace;
+    const isGraph = (leaf) => leaf && leaf.view && GRAPH_TYPES.includes(leaf.view.getViewType());
+    const usable = (leaf) => leaf && !isGraph(leaf) && (!graphLeaf || leaf.parent !== graphLeaf.parent) && leaf.getRoot && leaf.getRoot() === ws.rootSplit;
+    let target = null;
+    if (this.notesPaneRef && Array.isArray(this.notesPaneRef.children) && this.notesPaneRef.children.some((l) => usable(l))) {
+      return this.notesPaneRef;
+    }
+    const recent = ws.getMostRecentLeaf && ws.getMostRecentLeaf();
+    if (usable(recent)) target = recent;
+    if (!target) ws.iterateRootLeaves((leaf) => { if (!target && usable(leaf)) target = leaf; });
+    this.notesPaneRef = target ? target.parent : null;
+    return this.notesPaneRef;
+  }
+
+  openPathsAnywhere() {
+    return new Set(this.leavesByPath().keys());
+  }
+
+  leavesByPath() {
+    const out = new Map();
+    this.app.workspace.iterateRootLeaves((leaf) => { const p = this.leafPath(leaf); if (p && !out.has(p)) out.set(p, leaf); });
+    return out;
+  }
+
+  markPending(path) {
+    if (!this.pending) this.pending = new Map();
+    this.pending.set(path, now());
+  }
+
+  isPending(path) {
+    const t = this.pending && this.pending.get(path);
+    return t != null && now() - t < 1500;
+  }
+
+  syncTabs(graphLeaf, focusId) {
+    const ws = this.app.workspace;
+    this.snapshotViews();
+    graphLeaf = this.graphLeafForTabs(graphLeaf);
+    const want = this.selection.filter((id) => this.isFile(id));
+    let pane = this.notesPane(graphLeaf);
+    let fresh = null;
+    if (!pane) {
+      if (!want.length || !graphLeaf || graphLeaf.getRoot() !== ws.rootSplit) return;
+      fresh = ws.createLeafBySplit(graphLeaf, 'vertical');
+      pane = fresh.parent;
+      this.notesPaneRef = pane;
+    }
+    const leaves = (Array.isArray(pane.children) ? pane.children : []).filter((l) => l && l.view);
+    const kept = new Map();
+    const spare = [];
+    for (const leaf of leaves) {
+      const p = this.leafPath(leaf);
+      if (this.isPinnedLeaf(leaf)) { if (p) kept.set(p, leaf); continue; }
+      if (p && want.includes(p) && !kept.has(p)) { kept.set(p, leaf); continue; }
+      const type = leaf.view.getViewType && leaf.view.getViewType();
+      if (p || type === 'empty') spare.push(leaf);
+    }
+    const elsewhere = this.leavesByPath();
+    for (const id of want) {
+      if (kept.has(id)) continue;
+      const other = elsewhere.get(id);
+      if (other && other.parent !== pane) { kept.set(id, other); continue; } // already open in another pane
+      let leaf = spare.shift() || null;
+      if (!leaf) {
+        try {
+          if (typeof ws.createLeafInParent === 'function') leaf = ws.createLeafInParent(pane, Array.isArray(pane.children) ? pane.children.length : 0);
+        } catch (e) { leaf = null; }
+      }
+      if (!leaf) continue;
+      const file = this.app.vault.getAbstractFileByPath(id);
+      this.markPending(id);
+      try { leaf.openFile(file, this.readingState()); } catch (e) { /* ignore */ }
+      kept.set(id, leaf);
+    }
+    for (const leaf of spare) { try { leaf.detach(); } catch (e) { /* ignore */ } }
+    const focusLeaf = focusId && kept.get(focusId);
+    if (focusLeaf) { try { ws.setActiveLeaf(focusLeaf, { focus: false }); } catch (e) { /* ignore */ } }
+  }
+
+  // A selected note whose tab has been closed is deselected.
+  checkClosedTabs() {
+    if (!this.tabsManaged() || !this.selection.length) return;
+    const open = this.openPathsAnywhere();
+    const gone = this.selection.filter((id) => this.isFile(id) && !open.has(id) && !this.isPending(id));
+    if (!gone.length) return;
+    this.selection = this.selection.filter((id) => !gone.includes(id));
+    this.selectedId = this.selection[0] || null;
+    if (!this.selectedId) { this.stopPans(); for (const hook of this.hooks.values()) hook.store = null; }
+    this.refreshIndicators();
+    this.redrawAll();
+    if (this.selection.length && this.settings.centerOnSelect) this.centerOn(this.selection);
+  }
+
+  openOutsideGraph(graphLeaf, path, newTab) {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) return false;
     const ws = this.app.workspace;
@@ -962,9 +1799,23 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
     if (!target) ws.iterateRootLeaves((leaf) => { if (!target && usable(leaf)) target = leaf; });
     if (!target) {
       if (!graphLeaf || graphLeaf.getRoot() !== ws.rootSplit) return false; // local graph in a sidebar
+      this.snapshotViews();
       target = ws.createLeafBySplit(graphLeaf, 'vertical');
+    } else if (newTab) {
+      // A new tab in the same pane that a normal click would use.
+      let leaf = null;
+      try {
+        if (typeof ws.createLeafInParent === 'function' && target.parent) {
+          const kids = Array.isArray(target.parent.children) ? target.parent.children.length : 0;
+          leaf = ws.createLeafInParent(target.parent, kids);
+        }
+      } catch (e) { leaf = null; }
+      if (!leaf) {
+        try { ws.setActiveLeaf(target, { focus: false }); this.redirecting = true; leaf = ws.getLeaf('tab'); } catch (e) { leaf = null; } finally { this.redirecting = false; this.lastGetLeaf = null; }
+      }
+      if (leaf) target = leaf;
     }
-    target.openFile(file);
+    target.openFile(file, this.readingState());
     return true;
   }
 
@@ -972,8 +1823,11 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
 
   copyDiagnostics() {
     const lines = [`Obsidian ${window.electron ? 'desktop' : ''} | apiVersion ${require('obsidian').apiVersion || '?'}`,
-      `mode=${this.settings.mode} selected=${this.selectedId} hovered=${this.hoverId}`,
-      `hover signals seen: ${JSON.stringify(this.signals)}`];
+      `mode=${this.settings.mode} selected=${this.selectedId} selection=${this.selection.length} hovered=${this.hoverId} tabsManaged=${this.tabsManaged()} notesPane=${this.notesPaneRef ? (this.notesPaneRef.children || []).length + ' tabs' : 'none'}`,
+      `hover signals seen: ${JSON.stringify(this.signals)}`,
+      `plugin folder: ${this.manifest && this.manifest.dir} | id: ${this.manifest && this.manifest.id} | errors: ${(this.loadErrors || []).join(' ; ') || 'none'}`,
+      `this startup: ${JSON.stringify(this.startupLog || null)}`,
+      `previous startup: ${JSON.stringify(this.previousStartupLog || null)}`];
     for (const [renderer, hook] of this.hooks) {
       const node = Array.isArray(renderer.nodes) ? renderer.nodes[0] : null;
       const keys = (o) => {
@@ -989,7 +1843,9 @@ module.exports = class IntuitiveGraphNavigationPlugin extends Plugin {
         const link = Array.isArray(renderer.links) ? renderer.links[0] : null;
         if (link) {
           const ks = (o) => Object.keys(o).map((k) => `${k}:${o[k] && typeof o[k] === 'object' ? ('tint' in o[k] ? 'tinted' : 'obj') : typeof o[k]}`).join(',');
-          lines.push(`link: ${ks(link)} | hooked line objects=${this.tintHooks.size}`);
+          lines.push(`link: ${ks(link)} | render=${typeof link.render} | hooked line objects=${this.tintHooks.size}`);
+          const ms = this.multiState(renderer);
+          if (ms) lines.push(`multi: selected=${ms.selectedList.length} shared=${ms.shared.size}`);
         } else lines.push('link: none');
         try { lines.push(`node fill: ${JSON.stringify(node.getFillColor && node.getFillColor())} color=${JSON.stringify(node.color)}`); } catch (e) { lines.push('node fill: error'); }
         lines.push(`circle: ${node.circle ? `on=${typeof node.circle.on} eventMode=${node.circle.eventMode} interactive=${node.circle.interactive} type=${node.circle.constructor && node.circle.constructor.name} lineStyle=${typeof node.circle.lineStyle} tint=${node.circle.tint}` : 'none'}`);
@@ -1044,7 +1900,7 @@ class IntuitiveGraphNavigationSettingTab extends PluginSettingTab {
         .addOption('click', 'Click mode')
         .addOption('hover', 'Hover mode')
         .setValue(s.mode)
-        .onChange(async (v) => { s.mode = v; if (v === 'hover') this.plugin.selectedId = null; await this.plugin.saveSettings(); }));
+        .onChange(async (v) => { s.mode = v; if (v === 'hover') { this.plugin.selectedId = null; this.plugin.selection = []; } await this.plugin.saveSettings(); }));
 
     new Setting(containerEl)
       .setName('Keep graph tabs pinned')
@@ -1089,6 +1945,21 @@ class IntuitiveGraphNavigationSettingTab extends PluginSettingTab {
       .setName('Centre on selected node')
       .setDesc('In Click mode, the graph glides so the selected node moves to the centre of the view.')
       .addToggle((t) => t.setValue(s.centerOnSelect).onChange(async (v) => { s.centerOnSelect = v; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName('Tabs follow selection')
+      .setDesc('In Click mode, the notes pane beside the graph holds exactly the selected notes: selecting opens a tab, deselecting closes it, and Escape closes them all. Closing a note\'s tab deselects it. Pinned tabs are left alone.')
+      .addToggle((t) => t.setValue(s.tabsFollowSelection).onChange(async (v) => { s.tabsFollowSelection = v; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName('Open notes in Reading view')
+      .setDesc('Notes opened beside the graph start in Reading view. Click into a note to edit it; press Escape to return to Reading view.')
+      .addToggle((t) => t.setValue(s.openInReadingView).onChange(async (v) => { s.openInReadingView = v; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName('Note previews on hover')
+      .setDesc('Let Obsidian show a note preview when you hover a graph node or a file in the file explorer with Ctrl/Cmd held. Off by default, since Ctrl/Cmd is used for selecting several notes.')
+      .addToggle((t) => t.setValue(s.previewOnHover).onChange(async (v) => { s.previewOnHover = v; await this.plugin.saveSettings(); }));
 
     new Setting(containerEl)
       .setName('Open notes beside the graph')

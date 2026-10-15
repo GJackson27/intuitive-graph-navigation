@@ -1,9 +1,9 @@
 {
   "id": "intuitive-graph-navigation",
   "name": "Intuitive Graph Navigation",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "minAppVersion": "1.4.0",
-  "description": "Click graph nodes to keep them highlighted, colour connections by node, and keep group colours on highlighted nodes.",
+  "description": "Click graph nodes to keep them highlighted, select several with Ctrl/Cmd, glide the camera to them, keep your tabs in step with the selection, and colour connections by node.",
   "author": "Gregory Jackson",
   "isDesktopOnly": false
 }
